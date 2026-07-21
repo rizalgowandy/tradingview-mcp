@@ -6,6 +6,11 @@ import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
+
+// Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
+// destroying precision on forex/crypto prices. The old 2-dp rounding flattened
+// sub-cent levels to 0.00 (issue #77).
+const roundPrice = (v) => (v == null ? null : Math.round(v * 1e8) / 1e8);
 const CHART_API = KNOWN_PATHS.chartApi;
 const BARS_PATH = KNOWN_PATHS.mainSeriesBars;
 
@@ -24,11 +29,7 @@ const FIND_STRATEGY_JS = `
   function _reportOf(s) {
     try { var rd = s.reportData(); if (rd && typeof rd.value === 'function') rd = rd.value(); return rd; } catch (e) { return null; }
   }
-  // Returns { strat, report } — prefers a strategy whose report is actually
-  // computed (the one selected in the Strategy Tester panel). With multiple
-  // strategies on the chart, only the selected one has non-null reportData,
-  // so returning the first strategy blindly reads the wrong (empty) one.
-  function findStrategy() {
+  function findStrategies() {
     var chart = ${CHART_API}._chartWidget;
     var sources = chart.model().model().dataSources();
     var strategies = [];
@@ -40,6 +41,14 @@ const FIND_STRATEGY_JS = `
         strategies.push({ s: s, name: mi ? mi.description : null });
       }
     }
+    return strategies;
+  }
+  // Returns { strat, report } — prefers a strategy whose report is actually
+  // computed (the one selected in the Strategy Tester panel). With multiple
+  // strategies on the chart, only the selected one has non-null reportData,
+  // so returning the first strategy blindly reads the wrong (empty) one.
+  function findStrategy() {
+    var strategies = findStrategies();
     // Prefer one with a computed report (has .performance).
     for (var j = 0; j < strategies.length; j++) {
       var rd = _reportOf(strategies[j].s);
@@ -48,6 +57,29 @@ const FIND_STRATEGY_JS = `
     // None computed — return the first so callers can hint "open the panel".
     if (strategies.length) return { strat: strategies[0].s, report: null, name: strategies[0].name, strategy_count: strategies.length };
     return null;
+  }
+  // TradingView never computes a report for a hidden strategy (crossed-out eye
+  // in the legend), so a hidden one looks identical to "panel not opened yet".
+  // Unhide any hidden strategies and report their names so callers can tell
+  // the user what changed.
+  function unhideStrategies() {
+    var unhidden = [];
+    var strategies = findStrategies();
+    for (var i = 0; i < strategies.length; i++) {
+      var s = strategies[i].s;
+      try {
+        var vis = null;
+        try { vis = s.properties().visible.value(); } catch (e) {}
+        if (vis !== false) continue;
+        var done = false;
+        try { s.properties().visible.setValue(true); done = true; } catch (e) {}
+        if (!done) {
+          try { var st = ${CHART_API}.getStudyById(s.id()); if (st) { st.setVisible(true); done = true; } } catch (e) {}
+        }
+        if (done) unhidden.push(strategies[i].name || 'strategy');
+      } catch (e) {}
+    }
+    return unhidden;
   }
 `;
 
@@ -138,8 +170,8 @@ export async function getOhlcv({ count, summary } = {}) {
       period: { from: first.time, to: last.time },
       open: first.open, close: last.close,
       high: Math.max(...highs), low: Math.min(...lows),
-      range: Math.round((Math.max(...highs) - Math.min(...lows)) * 100) / 100,
-      change: Math.round((last.close - first.open) * 100) / 100,
+      range: roundPrice(Math.max(...highs) - Math.min(...lows)),
+      change: roundPrice(last.close - first.open),
       change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
       avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
       last_5_bars: bars.slice(-5),
@@ -176,19 +208,24 @@ export async function getIndicator({ entity_id }) {
 }
 
 // #173: TradingView doesn't compute strategy report/orders until the Strategy
-// Tester panel is opened. Ensure it's open (via bottomWidgetBar) and wait for
-// a strategy's reportData to populate, so the strategy read tools work even
-// when the panel started closed.
+// Tester panel is opened — and never computes one for a hidden strategy.
+// Ensure the panel is open (via bottomWidgetBar), unhide any hidden
+// strategies, and wait for reportData to populate, so the strategy read tools
+// work even when the panel started closed or the strategy was hidden.
+// Returns { status, unhidden } — unhidden lists strategies made visible.
 async function ensureStrategyTesterReady(maxWaitMs = 6000) {
-  await evaluate(`
+  const unhidden = await evaluate(`
     (function() {
+      ${FIND_STRATEGY_JS}
       try {
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
         if (bwb && typeof bwb.showWidget === 'function') bwb.showWidget('backtesting');
       } catch (e) {}
+      return unhideStrategies();
     })()
   `);
   const deadline = Date.now() + maxWaitMs;
+  let status = 'timeout';
   while (Date.now() < deadline) {
     const ready = await evaluate(`
       (function() {
@@ -198,14 +235,14 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
         return f.report && f.report.performance ? 'ready' : 'pending';
       })()
     `);
-    if (ready === 'ready' || ready === 'no-strategy') return ready;
+    if (ready === 'ready' || ready === 'no-strategy') { status = ready; break; }
     await new Promise(r => setTimeout(r, 500));
   }
-  return 'timeout';
+  return { status, unhidden: unhidden || [] };
 }
 
 export async function getStrategyResults() {
-  await ensureStrategyTesterReady();
+  const ready = await ensureStrategyTesterReady();
   const results = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
@@ -213,7 +250,7 @@ export async function getStrategyResults() {
         var found = findStrategy();
         if (!found) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy first (e.g. indicator_add with a "... Strategy" script).'};
         var rd = found.report;
-        if (!rd || !rd.performance) return {metrics: {}, source: 'internal_api', error: 'Strategy report not computed yet. Open the Strategy Tester panel (ui_open_panel strategy-tester) and retry.'};
+        if (!rd || !rd.performance) return {metrics: {}, source: 'internal_api', error: 'Strategy report not computed yet. Retry in a few seconds; if it persists, check the Strategy Tester panel is open (ui_open_panel strategy-tester) and the strategy is not hidden on the chart.'};
         var perf = rd.performance;
         var all = perf.all || {};
         // Headline metrics, named to match the Strategy Tester "Key stats".
@@ -245,12 +282,19 @@ export async function getStrategyResults() {
       } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: Object.keys(results?.metrics || {}).length > 0, metric_count: Object.keys(results?.metrics || {}).length, strategy: results?.strategy, currency: results?.currency, source: results?.source, metrics: results?.metrics || {}, error: results?.error };
+  return {
+    success: Object.keys(results?.metrics || {}).length > 0,
+    metric_count: Object.keys(results?.metrics || {}).length,
+    strategy: results?.strategy, currency: results?.currency, source: results?.source,
+    metrics: results?.metrics || {},
+    ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so the report could compute.' }),
+    error: results?.error,
+  };
 }
 
 export async function getTrades({ max_trades } = {}) {
   const limit = Math.min(max_trades || 20, MAX_TRADES);
-  await ensureStrategyTesterReady();
+  const ready = await ensureStrategyTesterReady();
   const trades = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
@@ -283,11 +327,17 @@ export async function getTrades({ max_trades } = {}) {
       } catch(e) { return {trades: [], source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: (trades?.trades?.length || 0) > 0, trade_count: trades?.trades?.length || 0, total_orders: trades?.total_orders ?? 0, source: trades?.source, trades: trades?.trades || [], error: trades?.error };
+  return {
+    success: (trades?.trades?.length || 0) > 0,
+    trade_count: trades?.trades?.length || 0, total_orders: trades?.total_orders ?? 0,
+    source: trades?.source, trades: trades?.trades || [],
+    ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so orders could compute.' }),
+    error: trades?.error,
+  };
 }
 
 export async function getEquity() {
-  await ensureStrategyTesterReady();
+  const ready = await ensureStrategyTesterReady();
   const equity = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
@@ -308,7 +358,13 @@ export async function getEquity() {
       } catch(e) { return {data: [], source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: (equity?.data?.length || 0) > 0, data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [], buy_hold_points: equity?.buy_hold_points, note: equity?.note, error: equity?.error };
+  return {
+    success: (equity?.data?.length || 0) > 0,
+    data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [],
+    buy_hold_points: equity?.buy_hold_points, note: equity?.note,
+    ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden }),
+    error: equity?.error,
+  };
 }
 
 export async function getQuote({ symbol } = {}) {
@@ -464,7 +520,13 @@ export async function getStudyValues() {
               }
             }
           } catch(e) {}
-          if (Object.keys(values).length > 0) results.push({ name: name, values: values });
+          // Include id + inputs so multiple instances of the same indicator
+          // (e.g. two EMAs with different lengths) are distinguishable (#143).
+          var id = null;
+          try { id = s.id ? s.id() : null; } catch(e) {}
+          var inputs = null;
+          try { var ip = s.inputs ? s.inputs() : null; if (ip && Object.keys(ip).length) inputs = ip; } catch(e) {}
+          if (Object.keys(values).length > 0) results.push({ id: id, name: name, inputs: inputs, values: values });
         } catch(e) {}
       }
       return results;
@@ -484,8 +546,8 @@ export async function getPineLines({ study_filter, verbose } = {}) {
     const allLines = [];
     for (const item of s.items) {
       const v = item.raw;
-      const y1 = v.y1 != null ? Math.round(v.y1 * 100) / 100 : null;
-      const y2 = v.y2 != null ? Math.round(v.y2 * 100) / 100 : null;
+      const y1 = roundPrice(v.y1);
+      const y2 = roundPrice(v.y2);
       if (verbose) allLines.push({ id: item.id, y1, y2, x1: v.x1, x2: v.x2, horizontal: v.y1 === v.y2, style: v.st, width: v.w, color: v.ci });
       if (y1 != null && v.y1 === v.y2 && !seen[y1]) { hLevels.push(y1); seen[y1] = true; }
     }
@@ -507,7 +569,7 @@ export async function getPineLabels({ study_filter, max_labels, verbose } = {}) 
     let labels = s.items.map(item => {
       const v = item.raw;
       const text = v.t || '';
-      const price = v.y != null ? Math.round(v.y * 100) / 100 : null;
+      const price = roundPrice(v.y);
       if (verbose) return { id: item.id, text, price, x: v.x, yloc: v.yl, size: v.sz, textColor: v.tci, color: v.ci };
       return { text, price };
     }).filter(l => l.text || l.price != null);
@@ -556,8 +618,8 @@ export async function getPineBoxes({ study_filter, verbose } = {}) {
     const allBoxes = [];
     for (const item of s.items) {
       const v = item.raw;
-      const high = v.y1 != null && v.y2 != null ? Math.round(Math.max(v.y1, v.y2) * 100) / 100 : null;
-      const low = v.y1 != null && v.y2 != null ? Math.round(Math.min(v.y1, v.y2) * 100) / 100 : null;
+      const high = v.y1 != null && v.y2 != null ? roundPrice(Math.max(v.y1, v.y2)) : null;
+      const low = v.y1 != null && v.y2 != null ? roundPrice(Math.min(v.y1, v.y2)) : null;
       if (verbose) allBoxes.push({ id: item.id, high, low, x1: v.x1, x2: v.x2, borderColor: v.c, bgColor: v.bc });
       if (high != null && low != null) { const key = high + ':' + low; if (!seen[key]) { zones.push({ high, low }); seen[key] = true; } }
     }
